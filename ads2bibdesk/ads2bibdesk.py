@@ -25,6 +25,29 @@ from .prefs import Preferences
 logger = logging.getLogger(__name__)
 
 
+#   Publisher sites increasingly sit behind bot-detection services (e.g. IOP /
+#   iopscience.org uses Radware Bot Manager, which 302s flagged requests to
+#   validate.perfdrive.com and answers 200 with an HTML challenge page).
+#   Two things get a plain requests call flagged, and BOTH must be fixed --
+#   neither alone is sufficient:
+#       - a stale User-Agent (the Chrome/68 string used until now dates to 2018)
+#       - requests' default "Accept: */*", which no real browser sends
+#   Keep these in one place so every outbound request looks the same.
+USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/131.0.0.0 Safari/537.36')
+
+BROWSER_HEADERS = {
+    'User-Agent': USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+#   Hosts that serve bot-check interstitials in place of the article. A landing
+#   page that ends up here is not worth parsing for a PDF link.
+BOT_CHECK_HOSTS = ('validate.perfdrive.com',)
+
+
 def main():
     """Parse options and launch main loop."""
     description = r"""
@@ -505,75 +528,108 @@ def process_pdf(article_bibcode, article_esources, prefs=None,
         # Determine the PDF URL based on esource type
         if esource_type == 'pub_html':
             logger.debug("Try: {}".format(esource_url))
-            response = requests.get(esource_url, allow_redirects=True, headers={
-                                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'})
+            response = requests.get(esource_url, allow_redirects=True,
+                                    headers=BROWSER_HEADERS)
             logger.debug("    >>> {}".format(response.url))
             pdf_url = get_pdf_fromhtml(response)
+            if pdf_url is None:
+                logger.debug("try failed >>> {}".format(esource_url))
+                continue
         else:
             pdf_url = esource_url
 
         logger.debug("Try: {}".format(pdf_url))
-        response = requests.get(pdf_url, allow_redirects=True, headers={
-                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'})
+        response = requests.get(pdf_url, allow_redirects=True,
+                                headers=BROWSER_HEADERS)
 
-        fd, pdf_filename = tempfile.mkstemp(suffix='.pdf')
-        if response.status_code not in [404, 403]:
-            os.fdopen(fd, 'wb').write(response.content)
+        #   Each attempt gets its own temp file, so it has to be cleaned up
+        #   again unless it turns out to hold the PDF we return.
+        attempt_filename = None
 
-        # Check if downloaded file is a PDF
-        if 'PDF document' in get_filetype(pdf_filename):
-            pdf_status = True
-            logger.debug("Try succeeded >>> {}".format(pdf_url))
-            break
+        if response.status_code in (403, 404):
+            logger.debug("Try failed >>> {} (HTTP {})".format(
+                pdf_url, response.status_code))
         else:
+            fd, attempt_filename = tempfile.mkstemp(suffix='.pdf')
+            with os.fdopen(fd, 'wb') as pdf_file:
+                pdf_file.write(response.content)
+
+            # Check if downloaded file is a PDF
+            if 'PDF document' in get_filetype(attempt_filename):
+                logger.debug("Try succeeded >>> {}".format(pdf_url))
+                return attempt_filename, True
+
             logger.debug("Try failed >>> {}".format(pdf_url))
 
         # If preference settings for proxy are available, attempt proxy download
-        if 'pub' in esource_type and prefs and prefs['proxy']['ssh_user'] != 'None' and prefs['proxy']['ssh_server'] != 'None':
-            pdf_status = process_pdf_proxy(pdf_url, pdf_filename,
-                                           prefs['proxy']['ssh_user'],
-                                           prefs['proxy']['ssh_server'],
-                                           port=prefs['proxy']['ssh_port'])
-            if pdf_status:
-                break
+        if 'pub' in esource_type and prefs and \
+                prefs['proxy']['ssh_user'] != 'None' and prefs['proxy']['ssh_server'] != 'None':
+            if attempt_filename is None:
+                fd, attempt_filename = tempfile.mkstemp(suffix='.pdf')
+                os.close(fd)
+            if process_pdf_proxy(pdf_url, attempt_filename,
+                                 prefs['proxy']['ssh_user'],
+                                 prefs['proxy']['ssh_server'],
+                                 port=prefs['proxy']['ssh_port']):
+                return attempt_filename, True
+
+        if attempt_filename is not None and os.path.exists(attempt_filename):
+            os.remove(attempt_filename)
 
     return pdf_filename, pdf_status
 
 
 def get_pdf_fromhtml(response):
     """
-    Guesses the PDF link from the journal article HTML URL.
+    Work out the PDF link from a journal article's landing page.
 
     Only works for some journals.
+
+    Note: this deliberately does *not* fall back to guessing "<landing url>.pdf".
+    Every publisher that resolves at all does so via the citation_pdf_url meta
+    tag or one of the host-specific rules below; the pages that reach the guess
+    are JS redirect stubs (Elsevier linkinghub, SPIE /redirect/) and bot-check
+    interstitials, where appending ".pdf" to the stub URL can never work and
+    only costs an extra request plus a misleading "try failed" log line.
 
     Parameters:
         response (requests.Response): The response object containing the HTML of the journal article.
 
     Returns:
-        str: The URL of the PDF version of the article, if found; otherwise, the original HTML URL.
+        str: The URL of the PDF version of the article, or None when the response
+            is not an article page we can resolve, so the caller moves on to the
+            next esource instead of requesting a made-up URL.
     """
     # Extracting the URL of the HTML page
     url_html = response.url
 
-    # Initializing the PDF URL with the HTML URL
-    url_pdf = url_html + '.pdf'
+    if response.status_code != 200:
+        logger.debug(
+            "    >>> landing page returned HTTP {}".format(response.status_code))
+        return None
 
-    # Parsing the HTML content
-    tree = html.fromstring(response.content)
-
-    # Checking if a specific meta tag exists for the PDF URL
-    citation_pdf_url = tree.xpath("//meta[@name='citation_pdf_url']/@content")
-    if citation_pdf_url:
-        url_pdf = citation_pdf_url[0]
+    #   Bot-detection interstitials answer 200 with a challenge page rather than
+    #   the article, so status alone does not identify them.
+    if any(host in url_html for host in BOT_CHECK_HOSTS):
+        logger.debug("    >>> blocked by a bot check: {}".format(url_html))
+        return None
 
     # Handling specific cases for different journal websites
     if 'annualreviews.org' in url_html:
-        url_pdf = url_html.replace('/doi/', '/doi/pdf/')
+        return url_html.replace('/doi/', '/doi/pdf/')
 
     if 'link.springer.com' in url_html:
-        url_pdf = url_html.replace('book', 'content/pdf').replace('article', 'content/pdf') + '.pdf'
+        return url_html.replace('book', 'content/pdf').replace('article', 'content/pdf') + '.pdf'
 
-    return url_pdf
+    # Checking if a specific meta tag exists for the PDF URL
+    tree = html.fromstring(response.content)
+    citation_pdf_url = tree.xpath("//meta[@name='citation_pdf_url']/@content")
+    if citation_pdf_url:
+        return citation_pdf_url[0]
+
+    logger.debug(
+        "    >>> no citation_pdf_url on the landing page: {}".format(url_html))
+    return None
 
 
 def process_pdf_proxy(pdf_url, pdf_filename, user, server, port=22):
@@ -592,13 +648,15 @@ def process_pdf_proxy(pdf_url, pdf_filename, user, server, port=22):
     """
     client = socket.gethostname().replace(' ', '')
     tmpfile = f'/tmp/adsbibdesk.{client}.pdf'
+    accept = BROWSER_HEADERS['Accept']
 
     # Constructing the SSH command to download the PDF
     ssh_command = (
         f'ssh -p {port} {user}@{server} "touch {tmpfile}; '
         f'curl --output {tmpfile} -J -L --referer \\";auto\\" '
-        f'--user-agent \\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 '
-        f'(KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36\\" \\"{pdf_url}\\""'
+        f'--user-agent \\"{USER_AGENT}\\" '
+        f'-H \\"Accept: {accept}\\" '
+        f'\\"{pdf_url}\\""'
     )
 
     # Constructing the SCP command to copy the downloaded PDF to local filesystem
