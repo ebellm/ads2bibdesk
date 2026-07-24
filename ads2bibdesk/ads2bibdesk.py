@@ -25,6 +25,25 @@ from .prefs import Preferences
 logger = logging.getLogger(__name__)
 
 
+#   Publisher sites increasingly sit behind bot-detection services (e.g. IOP /
+#   iopscience.org uses Radware Bot Manager, which 302s flagged requests to
+#   validate.perfdrive.com and answers 200 with an HTML challenge page).
+#   Two things get a plain requests call flagged, and BOTH must be fixed --
+#   neither alone is sufficient:
+#       - a stale User-Agent (the Chrome/68 string used until now dates to 2018)
+#       - requests' default "Accept: */*", which no real browser sends
+#   Keep these in one place so every outbound request looks the same.
+USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/131.0.0.0 Safari/537.36')
+
+BROWSER_HEADERS = {
+    'User-Agent': USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+
 def main():
     """Parse options and launch main loop."""
     description = r"""
@@ -505,16 +524,16 @@ def process_pdf(article_bibcode, article_esources, prefs=None,
         # Determine the PDF URL based on esource type
         if esource_type == 'pub_html':
             logger.debug("Try: {}".format(esource_url))
-            response = requests.get(esource_url, allow_redirects=True, headers={
-                                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'})
+            response = requests.get(esource_url, allow_redirects=True,
+                                    headers=BROWSER_HEADERS)
             logger.debug("    >>> {}".format(response.url))
             pdf_url = get_pdf_fromhtml(response)
         else:
             pdf_url = esource_url
 
         logger.debug("Try: {}".format(pdf_url))
-        response = requests.get(pdf_url, allow_redirects=True, headers={
-                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'})
+        response = requests.get(pdf_url, allow_redirects=True,
+                                headers=BROWSER_HEADERS)
 
         fd, pdf_filename = tempfile.mkstemp(suffix='.pdf')
         if response.status_code not in [404, 403]:
@@ -592,13 +611,15 @@ def process_pdf_proxy(pdf_url, pdf_filename, user, server, port=22):
     """
     client = socket.gethostname().replace(' ', '')
     tmpfile = f'/tmp/adsbibdesk.{client}.pdf'
+    accept = BROWSER_HEADERS['Accept']
 
     # Constructing the SSH command to download the PDF
     ssh_command = (
         f'ssh -p {port} {user}@{server} "touch {tmpfile}; '
         f'curl --output {tmpfile} -J -L --referer \\";auto\\" '
-        f'--user-agent \\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 '
-        f'(KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36\\" \\"{pdf_url}\\""'
+        f'--user-agent \\"{USER_AGENT}\\" '
+        f'-H \\"Accept: {accept}\\" '
+        f'\\"{pdf_url}\\""'
     )
 
     # Constructing the SCP command to copy the downloaded PDF to local filesystem
